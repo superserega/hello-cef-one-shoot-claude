@@ -4,49 +4,58 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Desktop browser for macOS with remote live streaming capability. Built with Rust using wry (WebView) and tao (window management).
+Desktop browser for macOS with remote live streaming capability. Supports two modes:
+- **GUI mode** - native window with wry/WKWebView
+- **Headless mode** - no GUI, uses Chrome via CDP (Chrome DevTools Protocol)
 
-Target platform: macOS (uses WKWebView under the hood)
-
-## Build Commands
+## Build & Run
 
 ```bash
 cargo build              # Debug build
 cargo build --release    # Release build
-cargo run                # Run debug build
+
+# GUI mode (default)
+cargo run -- --url https://example.com
+
+# Headless mode (no GUI, requires Chrome)
+cargo run -- --headless --url https://example.com --port 8765
 ```
+
+## CLI Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--headless` | false | Run without GUI using headless Chrome |
+| `--url <URL>` | https://example.com | Initial URL to load |
+| `--port <PORT>` | 8765 | HTTP server port for live stream |
+| `--width <W>` | 1200 | Viewport width |
+| `--height <H>` | 800 | Viewport height |
 
 ## Architecture
 
-**Single-process model using wry WebView:**
+**GUI Mode (wry):**
 - Window management via `tao` crate
 - WebView rendering via `wry` crate (WKWebView on macOS)
-- HTTP server for live streaming via `tiny_http`
 - Screenshot capture via `screenshots` crate
 
-**Tech stack:**
-- Language: Rust (edition 2021)
-- Web engine: wry (WKWebView)
-- Window: tao
-- HTTP: tiny_http
-- Image processing: image, base64
+**Headless Mode (chromiumoxide):**
+- Chrome browser controlled via CDP
+- Native screenshot via `Page.captureScreenshot`
+- No display required
 
-**Key components in main.rs:**
-- `Tab` struct - tab state (id, url, title)
-- `UserEvent` enum - IPC events between JS and Rust
-- `INIT_SCRIPT` - JavaScript injected into every page for toolbar UI
-- `capture_window()` - captures window area as JPEG
-- `start_http_server()` - HTTP server for `/live-stream` endpoint
+**Shared:**
+- HTTP server via `tiny_http` for live streaming
+- JSON API for frame delivery and navigation
 
-## Key Implementation Details
+## HTTP API
 
-- Toolbar (tabs, navigation, URL bar) is injected via JavaScript on every page load
-- IPC between JS and Rust via `window.ipc.postMessage()` with JSON payloads
-- Tab switching navigates the single WebView to different URLs (not true multi-tab)
-- Live stream available at `http://localhost:8765/live-stream` (JSON with base64 JPEG frame)
-- Viewer page at `http://localhost:8765/` polls for frames
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | Web viewer with live stream display |
+| `GET /live-stream` | JSON: `{"frame": "<base64 JPEG>", "url": "...", "timestamp": ...}` |
+| `GET /navigate?url=<URL>` | Navigate to URL (headless mode) |
 
-## Keyboard Shortcuts
+## Keyboard Shortcuts (GUI mode)
 
 - `Cmd+T` - New tab
 - `Cmd+W` - Close current tab

@@ -13,3 +13,8 @@ tiny_http = "0.12"
 base64 = "0.22"
 screenshots = "0.8"
 image = "0.25"
+chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-features = false }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+urlencoding = "2.1"

@@ -1,38 +1,292 @@
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::io::Cursor;
-use tao::{
-    dpi::LogicalSize,
-    event::{Event, WindowEvent},
-    event_loop::{ControlFlow, EventLoopBuilder},
-    window::WindowBuilder,
-};
-use wry::WebViewBuilder;
-use tiny_http::{Server, Response, Header};
+use clap::Parser;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use image::ImageFormat;
+use tiny_http::{Server, Response, Header};
 
-#[derive(Debug, Clone)]
-struct Tab {
-    id: usize,
+#[derive(Parser, Debug)]
+#[command(name = "Rust Browser Claude")]
+#[command(about = "Desktop browser with live streaming capability")]
+struct Args {
+    /// Run in headless mode (no GUI, uses Chrome)
+    #[arg(long)]
+    headless: bool,
+
+    /// Initial URL to load
+    #[arg(long, default_value = "https://example.com")]
     url: String,
-    title: String,
+
+    /// HTTP server port for live stream
+    #[arg(long, default_value = "8765")]
+    port: u16,
+
+    /// Viewport width (headless mode)
+    #[arg(long, default_value = "1200")]
+    width: u32,
+
+    /// Viewport height (headless mode)
+    #[arg(long, default_value = "800")]
+    height: u32,
 }
 
-#[derive(Debug, Clone)]
-enum UserEvent {
-    Navigate(String),
-    NewTab,
-    CloseTab(usize),
-    SwitchTab(usize),
-    PageLoaded,
+// ============== Shared Types ==============
+
+type ScreenshotBuffer = Arc<Mutex<Option<Vec<u8>>>>;
+type CurrentUrl = Arc<Mutex<String>>;
+
+// ============== HTTP Server ==============
+
+fn start_http_server_headless(
+    port: u16,
+    screenshot_buffer: ScreenshotBuffer,
+    current_url: CurrentUrl,
+) {
+    thread::spawn(move || {
+        let addr = format!("0.0.0.0:{}", port);
+        let server = match Server::http(&addr) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to start HTTP server: {}", e);
+                return;
+            }
+        };
+
+        println!("Live stream: http://localhost:{}/live-stream", port);
+        println!("Viewer:      http://localhost:{}/", port);
+
+        for request in server.incoming_requests() {
+            let url = request.url();
+
+            if url == "/live-stream" {
+                let buffer = screenshot_buffer.lock().unwrap();
+                if let Some(ref jpeg_bytes) = *buffer {
+                    let base64_frame = BASE64.encode(jpeg_bytes);
+                    let current = current_url.lock().unwrap().clone();
+                    let json = serde_json::json!({
+                        "frame": base64_frame,
+                        "url": current,
+                        "timestamp": std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis()
+                    });
+
+                    let response = Response::from_string(json.to_string())
+                        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap())
+                        .with_header(Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
+                        .with_header(Header::from_bytes(&b"Cache-Control"[..], &b"no-cache"[..]).unwrap());
+                    let _ = request.respond(response);
+                } else {
+                    let response = Response::from_string(r#"{"error":"no frame available"}"#)
+                        .with_status_code(503)
+                        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
+                    let _ = request.respond(response);
+                }
+            } else if url.starts_with("/navigate?") {
+                // Navigate to URL: /navigate?url=https://example.com
+                if let Some(new_url) = url.strip_prefix("/navigate?url=") {
+                    let decoded = urlencoding::decode(new_url).unwrap_or_default();
+                    *current_url.lock().unwrap() = decoded.to_string();
+                    let response = Response::from_string(r#"{"status":"navigating"}"#)
+                        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
+                    let _ = request.respond(response);
+                } else {
+                    let response = Response::from_string(r#"{"error":"missing url parameter"}"#)
+                        .with_status_code(400);
+                    let _ = request.respond(response);
+                }
+            } else if url == "/" {
+                let html = r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Rust Browser Claude - Live Stream</title>
+    <style>
+        body { margin: 0; background: #1a1a1a; display: flex; flex-direction: column; align-items: center; min-height: 100vh; padding: 20px; box-sizing: border-box; }
+        #controls { display: flex; gap: 10px; margin-bottom: 10px; width: 100%; max-width: 1200px; }
+        #url-input { flex: 1; padding: 8px 12px; border-radius: 4px; border: none; font-size: 14px; }
+        #go-btn { padding: 8px 16px; background: #4a90d9; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        #go-btn:hover { background: #3a80c9; }
+        img { max-width: 100%; max-height: calc(100vh - 100px); border: 1px solid #333; }
+        #status { position: fixed; top: 10px; right: 10px; color: #0f0; font-family: monospace; background: rgba(0,0,0,0.7); padding: 5px 10px; border-radius: 4px; }
+        #current-url { color: #888; font-family: monospace; font-size: 12px; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+    <div id="controls">
+        <input type="text" id="url-input" placeholder="Enter URL..." />
+        <button id="go-btn">Go</button>
+    </div>
+    <div id="current-url">-</div>
+    <div id="status">Connecting...</div>
+    <img id="screen" />
+    <script>
+        const img = document.getElementById('screen');
+        const status = document.getElementById('status');
+        const currentUrlEl = document.getElementById('current-url');
+        const urlInput = document.getElementById('url-input');
+        const goBtn = document.getElementById('go-btn');
+        let frameCount = 0;
+
+        async function navigate(url) {
+            if (!url.startsWith('http')) url = 'https://' + url;
+            await fetch('/navigate?url=' + encodeURIComponent(url));
+        }
+
+        goBtn.onclick = () => navigate(urlInput.value);
+        urlInput.onkeydown = (e) => { if (e.key === 'Enter') navigate(urlInput.value); };
+
+        async function fetchFrame() {
+            try {
+                const response = await fetch('/live-stream');
+                const data = await response.json();
+
+                if (data.frame) {
+                    img.src = 'data:image/jpeg;base64,' + data.frame;
+                    frameCount++;
+                    status.textContent = 'Frames: ' + frameCount;
+                    if (data.url) {
+                        currentUrlEl.textContent = data.url;
+                        urlInput.value = data.url;
+                    }
+                }
+            } catch (e) {
+                status.textContent = 'Error: ' + e.message;
+            }
+
+            setTimeout(fetchFrame, 100);
+        }
+
+        status.textContent = 'Connected';
+        fetchFrame();
+    </script>
+</body>
+</html>"#;
+
+                let response = Response::from_string(html)
+                    .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap());
+                let _ = request.respond(response);
+            } else {
+                let response = Response::from_string("Not Found").with_status_code(404);
+                let _ = request.respond(response);
+            }
+        }
+    });
 }
 
-type Tabs = Arc<Mutex<(Vec<Tab>, usize, usize)>>;
-type ScreenBuffer = Arc<Mutex<Option<Vec<u8>>>>;
-type WindowRect = Arc<Mutex<(i32, i32, u32, u32)>>; // x, y, width, height
+// ============== Headless Mode (Chrome CDP) ==============
 
-const INIT_SCRIPT: &str = r#"
+async fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    use chromiumoxide::browser::{Browser, BrowserConfig};
+    use futures::StreamExt;
+
+    println!("Starting headless browser...");
+
+    let screenshot_buffer: ScreenshotBuffer = Arc::new(Mutex::new(None));
+    let current_url: CurrentUrl = Arc::new(Mutex::new(args.url.clone()));
+
+    // Start HTTP server
+    start_http_server_headless(args.port, screenshot_buffer.clone(), current_url.clone());
+
+    // Launch headless Chrome
+    let config = BrowserConfig::builder()
+        .window_size(args.width, args.height)
+        .build()
+        .map_err(|e| format!("Failed to build browser config: {}", e))?;
+
+    let (browser, mut handler) = Browser::launch(config).await?;
+
+    // Spawn browser handler
+    let _handle = tokio::spawn(async move {
+        while let Some(event) = handler.next().await {
+            let _ = event;
+        }
+    });
+
+    // Create page and navigate
+    let page = browser.new_page(&args.url).await?;
+
+    println!("Headless browser started!");
+    println!("Initial URL: {}", args.url);
+    println!("");
+    println!("Navigate via: http://localhost:{}/navigate?url=<URL>", args.port);
+
+    let mut last_url = args.url.clone();
+
+    // Main loop: capture screenshots and handle navigation
+    loop {
+        // Check if URL changed (via HTTP API)
+        let new_url = current_url.lock().unwrap().clone();
+        if new_url != last_url {
+            println!("Navigating to: {}", new_url);
+            if let Err(e) = page.goto(&new_url).await {
+                eprintln!("Navigation error: {}", e);
+            }
+            last_url = new_url;
+        }
+
+        // Wait for page to be ready
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Capture screenshot
+        match page.screenshot(
+            chromiumoxide::page::ScreenshotParams::builder()
+                .format(chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat::Jpeg)
+                .quality(80)
+                .build()
+        ).await {
+            Ok(png_data) => {
+                *screenshot_buffer.lock().unwrap() = Some(png_data);
+            }
+            Err(e) => {
+                eprintln!("Screenshot error: {}", e);
+            }
+        }
+
+        // Small delay between captures
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+
+    #[allow(unreachable_code)]
+    {
+        _handle.abort();
+        Ok(())
+    }
+}
+
+// ============== GUI Mode (wry/tao) ==============
+
+mod gui {
+    use super::*;
+    use tao::{
+        dpi::LogicalSize,
+        event::{Event, WindowEvent},
+        event_loop::{ControlFlow, EventLoopBuilder},
+        window::WindowBuilder,
+    };
+    use wry::WebViewBuilder;
+
+    #[derive(Debug, Clone)]
+    pub struct Tab {
+        pub id: usize,
+        pub url: String,
+        pub title: String,
+    }
+
+    #[derive(Debug, Clone)]
+    pub enum UserEvent {
+        Navigate(String),
+        NewTab,
+        CloseTab(usize),
+        SwitchTab(usize),
+        PageLoaded,
+    }
+
+    pub type Tabs = Arc<Mutex<(Vec<Tab>, usize, usize)>>;
+    pub type WindowRect = Arc<Mutex<(i32, i32, u32, u32)>>;
+
+    pub const INIT_SCRIPT: &str = r#"
 window.__rustBrowserReady = true;
 window.__injectToolbar = function(tabsHtml, currentUrl) {
     const old = document.getElementById('__rust_browser_toolbar__');
@@ -210,102 +464,97 @@ document.addEventListener('keydown', function(e) {
 });
 "#;
 
-fn build_tabs_html(tabs: &[(usize, String, String)], active_id: usize) -> String {
-    tabs.iter().map(|(id, title, _url)| {
-        let active_class = if *id == active_id { "active" } else { "" };
-        let short_title = if title.len() > 18 {
-            format!("{}...", &title[..15])
-        } else {
-            title.clone()
-        };
-        format!(
-            r#"<div class="tab {}" data-id="{}"><span class="tab-title">{}</span><span class="tab-close" data-id="{}">×</span></div>"#,
-            active_class, id, short_title, id
-        )
-    }).collect()
-}
-
-fn inject_toolbar_script(tabs_html: &str, current_url: &str) -> String {
-    format!(
-        r#"if (window.__injectToolbar) {{ window.__injectToolbar(`{}`, `{}`); }}"#,
-        tabs_html.replace('`', "\\`"),
-        current_url.replace('`', "\\`")
-    )
-}
-
-fn capture_window(window_rect: &WindowRect) -> Option<Vec<u8>> {
-    use screenshots::Screen;
-
-    let (x, y, width, height) = *window_rect.lock().ok()?;
-
-    if width == 0 || height == 0 {
-        return None;
+    pub fn build_tabs_html(tabs: &[(usize, String, String)], active_id: usize) -> String {
+        tabs.iter().map(|(id, title, _url)| {
+            let active_class = if *id == active_id { "active" } else { "" };
+            let short_title = if title.len() > 18 {
+                format!("{}...", &title[..15])
+            } else {
+                title.clone()
+            };
+            format!(
+                r#"<div class="tab {}" data-id="{}"><span class="tab-title">{}</span><span class="tab-close" data-id="{}">×</span></div>"#,
+                active_class, id, short_title, id
+            )
+        }).collect()
     }
 
-    let screens = Screen::all().ok()?;
-    let screen = screens.first()?;
+    pub fn inject_toolbar_script(tabs_html: &str, current_url: &str) -> String {
+        format!(
+            r#"if (window.__injectToolbar) {{ window.__injectToolbar(`{}`, `{}`); }}"#,
+            tabs_html.replace('`', "\\`"),
+            current_url.replace('`', "\\`")
+        )
+    }
 
-    // Capture the specific area (screenshots crate uses logical coordinates on macOS)
-    let capture = screen.capture_area(x, y, width, height).ok()?;
+    fn capture_window(window_rect: &WindowRect) -> Option<Vec<u8>> {
+        use screenshots::Screen;
 
-    // Convert to JPEG
-    let rgba_image = image::RgbaImage::from_raw(
-        capture.width(),
-        capture.height(),
-        capture.to_vec(),
-    )?;
+        let (x, y, width, height) = *window_rect.lock().ok()?;
 
-    let rgb_image = image::DynamicImage::ImageRgba8(rgba_image).to_rgb8();
+        if width == 0 || height == 0 {
+            return None;
+        }
 
-    let mut jpeg_bytes = Cursor::new(Vec::new());
-    rgb_image.write_to(&mut jpeg_bytes, ImageFormat::Jpeg).ok()?;
+        let screens = Screen::all().ok()?;
+        let screen = screens.first()?;
 
-    Some(jpeg_bytes.into_inner())
-}
+        let capture = screen.capture_area(x, y, width, height).ok()?;
 
-fn start_http_server(_screen_buffer: ScreenBuffer, screen_changed: Arc<AtomicBool>, window_rect: WindowRect) {
-    thread::spawn(move || {
-        let server = match Server::http("0.0.0.0:8765") {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Failed to start HTTP server: {}", e);
-                return;
-            }
-        };
+        let rgba_image = image::RgbaImage::from_raw(
+            capture.width(),
+            capture.height(),
+            capture.to_vec(),
+        )?;
 
-        println!("Live stream available at http://localhost:8765/live-stream");
+        let rgb_image = image::DynamicImage::ImageRgba8(rgba_image).to_rgb8();
 
-        for request in server.incoming_requests() {
-            let url = request.url();
+        let mut jpeg_bytes = Cursor::new(Vec::new());
+        rgb_image.write_to(&mut jpeg_bytes, ImageFormat::Jpeg).ok()?;
 
-            if url == "/live-stream" {
-                // Return single frame as JSON
-                screen_changed.store(false, Ordering::Relaxed);
+        Some(jpeg_bytes.into_inner())
+    }
 
-                if let Some(jpeg_bytes) = capture_window(&window_rect) {
-                    let base64_frame = BASE64.encode(&jpeg_bytes);
-                    let json = serde_json::json!({
-                        "frame": base64_frame,
-                        "timestamp": std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis()
-                    });
-
-                    let response = Response::from_string(json.to_string())
-                        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap())
-                        .with_header(Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
-                        .with_header(Header::from_bytes(&b"Cache-Control"[..], &b"no-cache"[..]).unwrap());
-                    let _ = request.respond(response);
-                } else {
-                    let response = Response::from_string(r#"{"error":"capture failed"}"#)
-                        .with_status_code(500)
-                        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
-                    let _ = request.respond(response);
+    fn start_http_server_gui(port: u16, screen_changed: Arc<AtomicBool>, window_rect: WindowRect) {
+        thread::spawn(move || {
+            let addr = format!("0.0.0.0:{}", port);
+            let server = match Server::http(&addr) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Failed to start HTTP server: {}", e);
+                    return;
                 }
-            } else if url == "/" {
-                // Simple HTML viewer with polling
-                let html = r#"<!DOCTYPE html>
+            };
+
+            for request in server.incoming_requests() {
+                let url = request.url();
+
+                if url == "/live-stream" {
+                    screen_changed.store(false, Ordering::Relaxed);
+
+                    if let Some(jpeg_bytes) = capture_window(&window_rect) {
+                        let base64_frame = BASE64.encode(&jpeg_bytes);
+                        let json = serde_json::json!({
+                            "frame": base64_frame,
+                            "timestamp": std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis()
+                        });
+
+                        let response = Response::from_string(json.to_string())
+                            .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap())
+                            .with_header(Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
+                            .with_header(Header::from_bytes(&b"Cache-Control"[..], &b"no-cache"[..]).unwrap());
+                        let _ = request.respond(response);
+                    } else {
+                        let response = Response::from_string(r#"{"error":"capture failed"}"#)
+                            .with_status_code(500)
+                            .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
+                        let _ = request.respond(response);
+                    }
+                } else if url == "/" {
+                    let html = r#"<!DOCTYPE html>
 <html>
 <head>
     <title>Rust Browser Claude - Live Stream</title>
@@ -322,16 +571,14 @@ fn start_http_server(_screen_buffer: ScreenBuffer, screen_changed: Arc<AtomicBoo
         const img = document.getElementById('screen');
         const status = document.getElementById('status');
         let frameCount = 0;
-        let lastTimestamp = 0;
 
         async function fetchFrame() {
             try {
                 const response = await fetch('/live-stream');
                 const data = await response.json();
 
-                if (data.frame && data.timestamp !== lastTimestamp) {
+                if (data.frame) {
                     img.src = 'data:image/jpeg;base64,' + data.frame;
-                    lastTimestamp = data.timestamp;
                     frameCount++;
                     status.textContent = 'Frames: ' + frameCount;
                 }
@@ -339,7 +586,7 @@ fn start_http_server(_screen_buffer: ScreenBuffer, screen_changed: Arc<AtomicBoo
                 status.textContent = 'Error: ' + e.message;
             }
 
-            setTimeout(fetchFrame, 100); // Poll every 100ms
+            setTimeout(fetchFrame, 100);
         }
 
         status.textContent = 'Connected';
@@ -348,228 +595,135 @@ fn start_http_server(_screen_buffer: ScreenBuffer, screen_changed: Arc<AtomicBoo
 </body>
 </html>"#;
 
-                let response = Response::from_string(html)
-                    .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap());
-                let _ = request.respond(response);
-            } else {
-                let response = Response::from_string("Not Found").with_status_code(404);
-                let _ = request.respond(response);
+                    let response = Response::from_string(html)
+                        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap());
+                    let _ = request.respond(response);
+                } else {
+                    let response = Response::from_string("Not Found").with_status_code(404);
+                    let _ = request.respond(response);
+                }
             }
-        }
-    });
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
-    let proxy = event_loop.create_proxy();
-
-    let window = WindowBuilder::new()
-        .with_title("Rust Browser Claude")
-        .with_inner_size(LogicalSize::new(1200.0, 800.0))
-        .build(&event_loop)?;
-
-    // Screen streaming state
-    let screen_buffer: ScreenBuffer = Arc::new(Mutex::new(None));
-    let screen_changed = Arc::new(AtomicBool::new(true));
-
-    // Window position and size for capturing
-    let window_rect: WindowRect = Arc::new(Mutex::new((0, 0, 1200, 800)));
-
-    // Update initial window rect
-    if let Ok(pos) = window.outer_position() {
-        let size = window.outer_size();
-        *window_rect.lock().unwrap() = (pos.x, pos.y, size.width, size.height);
+        });
     }
 
-    // Start HTTP server for live streaming
-    start_http_server(screen_buffer.clone(), screen_changed.clone(), window_rect.clone());
+    pub fn run_gui(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+        let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+        let proxy = event_loop.create_proxy();
 
-    // Initialize tabs
-    let tabs: Tabs = Arc::new(Mutex::new((
-        vec![Tab { id: 1, url: "https://example.com".to_string(), title: "Example".to_string() }],
-        1,
-        2,
-    )));
+        let window = WindowBuilder::new()
+            .with_title("Rust Browser Claude")
+            .with_inner_size(LogicalSize::new(args.width as f64, args.height as f64))
+            .build(&event_loop)?;
 
-    let tabs_ipc = tabs.clone();
-    let proxy_ipc = proxy.clone();
-    let screen_changed_ipc = screen_changed.clone();
+        let screen_changed = Arc::new(AtomicBool::new(true));
+        let window_rect: WindowRect = Arc::new(Mutex::new((0, 0, args.width, args.height)));
 
-    let webview = WebViewBuilder::new()
-        .with_url("https://example.com")
-        .with_initialization_script(INIT_SCRIPT)
-        .with_ipc_handler(move |req| {
-            let body = req.body();
-            if let Ok(msg) = serde_json::from_str::<serde_json::Value>(body) {
-                if let Some(url) = msg["navigate"].as_str() {
-                    let _ = proxy_ipc.send_event(UserEvent::Navigate(url.to_string()));
-                }
-                if msg["newTab"].as_bool() == Some(true) {
-                    let _ = proxy_ipc.send_event(UserEvent::NewTab);
-                }
-                if let Some(id) = msg["switchTab"].as_u64() {
-                    let _ = proxy_ipc.send_event(UserEvent::SwitchTab(id as usize));
-                }
-                if let Some(id) = msg["closeTab"].as_u64() {
-                    let _ = proxy_ipc.send_event(UserEvent::CloseTab(id as usize));
-                }
-                if msg["closeCurrentTab"].as_bool() == Some(true) {
-                    let (_, active_id, _) = &*tabs_ipc.lock().unwrap();
-                    let _ = proxy_ipc.send_event(UserEvent::CloseTab(*active_id));
-                }
-                if msg["pageLoaded"].as_bool() == Some(true) {
-                    let _ = proxy_ipc.send_event(UserEvent::PageLoaded);
-                }
-            }
-            // Mark screen as changed on any IPC message
-            screen_changed_ipc.store(true, Ordering::Relaxed);
-        })
-        .with_devtools(true)
-        .build(&window)?;
-
-    println!("Rust Browser Claude started!");
-    println!("Cmd+T: New tab | Cmd+W: Close tab | Cmd+L: Focus URL");
-    println!("");
-    println!("Live stream: http://localhost:8765/live-stream");
-    println!("Viewer:      http://localhost:8765/");
-
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
-
-        // Mark screen changed on any window event
-        match &event {
-            Event::WindowEvent { .. } | Event::UserEvent(_) => {
-                screen_changed.store(true, Ordering::Relaxed);
-            }
-            _ => {}
+        if let Ok(pos) = window.outer_position() {
+            let size = window.outer_size();
+            *window_rect.lock().unwrap() = (pos.x, pos.y, size.width, size.height);
         }
 
-        match event {
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => *control_flow = ControlFlow::Exit,
+        start_http_server_gui(args.port, screen_changed.clone(), window_rect.clone());
 
-            Event::WindowEvent {
-                event: WindowEvent::Moved(position),
-                ..
-            } => {
-                let mut rect = window_rect.lock().unwrap();
-                rect.0 = position.x;
-                rect.1 = position.y;
+        let tabs: Tabs = Arc::new(Mutex::new((
+            vec![Tab { id: 1, url: args.url.clone(), title: "New Tab".to_string() }],
+            1,
+            2,
+        )));
+
+        let tabs_ipc = tabs.clone();
+        let proxy_ipc = proxy.clone();
+        let screen_changed_ipc = screen_changed.clone();
+
+        let webview = WebViewBuilder::new()
+            .with_url(&args.url)
+            .with_initialization_script(INIT_SCRIPT)
+            .with_ipc_handler(move |req| {
+                let body = req.body();
+                if let Ok(msg) = serde_json::from_str::<serde_json::Value>(body) {
+                    if let Some(url) = msg["navigate"].as_str() {
+                        let _ = proxy_ipc.send_event(UserEvent::Navigate(url.to_string()));
+                    }
+                    if msg["newTab"].as_bool() == Some(true) {
+                        let _ = proxy_ipc.send_event(UserEvent::NewTab);
+                    }
+                    if let Some(id) = msg["switchTab"].as_u64() {
+                        let _ = proxy_ipc.send_event(UserEvent::SwitchTab(id as usize));
+                    }
+                    if let Some(id) = msg["closeTab"].as_u64() {
+                        let _ = proxy_ipc.send_event(UserEvent::CloseTab(id as usize));
+                    }
+                    if msg["closeCurrentTab"].as_bool() == Some(true) {
+                        let (_, active_id, _) = &*tabs_ipc.lock().unwrap();
+                        let _ = proxy_ipc.send_event(UserEvent::CloseTab(*active_id));
+                    }
+                    if msg["pageLoaded"].as_bool() == Some(true) {
+                        let _ = proxy_ipc.send_event(UserEvent::PageLoaded);
+                    }
+                }
+                screen_changed_ipc.store(true, Ordering::Relaxed);
+            })
+            .with_devtools(true)
+            .build(&window)?;
+
+        println!("Rust Browser Claude started (GUI mode)");
+        println!("Cmd+T: New tab | Cmd+W: Close tab | Cmd+L: Focus URL | F12: DevTools");
+        println!("");
+        println!("Live stream: http://localhost:{}/live-stream", args.port);
+        println!("Viewer:      http://localhost:{}/", args.port);
+
+        event_loop.run(move |event, _, control_flow| {
+            *control_flow = ControlFlow::Wait;
+
+            match &event {
+                Event::WindowEvent { .. } | Event::UserEvent(_) => {
+                    screen_changed.store(true, Ordering::Relaxed);
+                }
+                _ => {}
             }
 
-            Event::WindowEvent {
-                event: WindowEvent::Resized(size),
-                ..
-            } => {
-                let mut rect = window_rect.lock().unwrap();
-                rect.2 = size.width;
-                rect.3 = size.height;
-            }
+            match event {
+                Event::WindowEvent {
+                    event: WindowEvent::CloseRequested,
+                    ..
+                } => *control_flow = ControlFlow::Exit,
 
-            Event::WindowEvent {
-                event: WindowEvent::KeyboardInput { event: key_event, .. },
-                ..
-            } => {
-                if key_event.state == tao::event::ElementState::Pressed {
-                    if let tao::keyboard::KeyCode::F12 = key_event.physical_key {
-                        if webview.is_devtools_open() {
-                            webview.close_devtools();
-                        } else {
-                            webview.open_devtools();
+                Event::WindowEvent {
+                    event: WindowEvent::Moved(position),
+                    ..
+                } => {
+                    let mut rect = window_rect.lock().unwrap();
+                    rect.0 = position.x;
+                    rect.1 = position.y;
+                }
+
+                Event::WindowEvent {
+                    event: WindowEvent::Resized(size),
+                    ..
+                } => {
+                    let mut rect = window_rect.lock().unwrap();
+                    rect.2 = size.width;
+                    rect.3 = size.height;
+                }
+
+                Event::WindowEvent {
+                    event: WindowEvent::KeyboardInput { event: key_event, .. },
+                    ..
+                } => {
+                    if key_event.state == tao::event::ElementState::Pressed {
+                        if let tao::keyboard::KeyCode::F12 = key_event.physical_key {
+                            if webview.is_devtools_open() {
+                                webview.close_devtools();
+                            } else {
+                                webview.open_devtools();
+                            }
                         }
                     }
                 }
-            }
 
-            Event::UserEvent(ref user_event) => {
-                match user_event {
-                    UserEvent::PageLoaded => {
-                        let (tabs_vec, active_id, _) = &*tabs.lock().unwrap();
-                        let current_url = tabs_vec.iter()
-                            .find(|t| t.id == *active_id)
-                            .map(|t| t.url.as_str())
-                            .unwrap_or("about:blank");
-                        let tabs_data: Vec<_> = tabs_vec.iter()
-                            .map(|t| (t.id, t.title.clone(), t.url.clone()))
-                            .collect();
-                        let tabs_html = build_tabs_html(&tabs_data, *active_id);
-                        let script = inject_toolbar_script(&tabs_html, current_url);
-                        let _ = webview.evaluate_script(&script);
-                    }
-
-                    UserEvent::Navigate(url) => {
-                        let url = if !url.starts_with("http://") && !url.starts_with("https://") {
-                            if url.contains('.') && !url.contains(' ') {
-                                format!("https://{}", url)
-                            } else {
-                                format!("https://www.google.com/search?q={}", url.replace(' ', "+"))
-                            }
-                        } else {
-                            url.clone()
-                        };
-
-                        {
-                            let (tabs_vec, active_id, _) = &mut *tabs.lock().unwrap();
-                            if let Some(tab) = tabs_vec.iter_mut().find(|t| t.id == *active_id) {
-                                tab.url = url.clone();
-                                if let Ok(parsed) = url::Url::parse(&url) {
-                                    tab.title = parsed.host_str().unwrap_or("Page").to_string();
-                                }
-                            }
-                        }
-
-                        let js = format!("window.location.href = '{}'", url.replace('\'', "\\'"));
-                        let _ = webview.evaluate_script(&js);
-                    }
-
-                    UserEvent::NewTab => {
-                        let new_url = "https://example.com".to_string();
-                        {
-                            let (tabs_vec, active_id, next_id) = &mut *tabs.lock().unwrap();
-                            let new_tab = Tab {
-                                id: *next_id,
-                                url: new_url.clone(),
-                                title: "New Tab".to_string(),
-                            };
-                            tabs_vec.push(new_tab);
-                            *active_id = *next_id;
-                            *next_id += 1;
-                        }
-
-                        let js = format!("window.location.href = '{}'", new_url);
-                        let _ = webview.evaluate_script(&js);
-                    }
-
-                    UserEvent::CloseTab(id) => {
-                        let should_navigate: Option<String>;
-                        {
-                            let (tabs_vec, active_id, _) = &mut *tabs.lock().unwrap();
-                            if tabs_vec.len() <= 1 {
-                                return;
-                            }
-
-                            let idx = tabs_vec.iter().position(|t| t.id == *id);
-                            if let Some(idx) = idx {
-                                tabs_vec.remove(idx);
-
-                                if *active_id == *id {
-                                    let new_idx = idx.min(tabs_vec.len() - 1);
-                                    *active_id = tabs_vec[new_idx].id;
-                                    should_navigate = Some(tabs_vec[new_idx].url.clone());
-                                } else {
-                                    should_navigate = None;
-                                }
-                            } else {
-                                should_navigate = None;
-                            }
-                        }
-
-                        if let Some(url) = should_navigate {
-                            let js = format!("window.location.href = '{}'", url.replace('\'', "\\'"));
-                            let _ = webview.evaluate_script(&js);
-                        } else {
+                Event::UserEvent(ref user_event) => {
+                    match user_event {
+                        UserEvent::PageLoaded => {
                             let (tabs_vec, active_id, _) = &*tabs.lock().unwrap();
                             let current_url = tabs_vec.iter()
                                 .find(|t| t.id == *active_id)
@@ -582,27 +736,127 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let script = inject_toolbar_script(&tabs_html, current_url);
                             let _ = webview.evaluate_script(&script);
                         }
-                    }
 
-                    UserEvent::SwitchTab(id) => {
-                        let url: String;
-                        {
-                            let (tabs_vec, active_id, _) = &mut *tabs.lock().unwrap();
-                            if let Some(tab) = tabs_vec.iter().find(|t| t.id == *id) {
-                                *active_id = *id;
-                                url = tab.url.clone();
+                        UserEvent::Navigate(url) => {
+                            let url = if !url.starts_with("http://") && !url.starts_with("https://") {
+                                if url.contains('.') && !url.contains(' ') {
+                                    format!("https://{}", url)
+                                } else {
+                                    format!("https://www.google.com/search?q={}", url.replace(' ', "+"))
+                                }
                             } else {
-                                return;
+                                url.clone()
+                            };
+
+                            {
+                                let (tabs_vec, active_id, _) = &mut *tabs.lock().unwrap();
+                                if let Some(tab) = tabs_vec.iter_mut().find(|t| t.id == *active_id) {
+                                    tab.url = url.clone();
+                                    if let Ok(parsed) = url::Url::parse(&url) {
+                                        tab.title = parsed.host_str().unwrap_or("Page").to_string();
+                                    }
+                                }
+                            }
+
+                            let js = format!("window.location.href = '{}'", url.replace('\'', "\\'"));
+                            let _ = webview.evaluate_script(&js);
+                        }
+
+                        UserEvent::NewTab => {
+                            let new_url = "https://example.com".to_string();
+                            {
+                                let (tabs_vec, active_id, next_id) = &mut *tabs.lock().unwrap();
+                                let new_tab = Tab {
+                                    id: *next_id,
+                                    url: new_url.clone(),
+                                    title: "New Tab".to_string(),
+                                };
+                                tabs_vec.push(new_tab);
+                                *active_id = *next_id;
+                                *next_id += 1;
+                            }
+
+                            let js = format!("window.location.href = '{}'", new_url);
+                            let _ = webview.evaluate_script(&js);
+                        }
+
+                        UserEvent::CloseTab(id) => {
+                            let should_navigate: Option<String>;
+                            {
+                                let (tabs_vec, active_id, _) = &mut *tabs.lock().unwrap();
+                                if tabs_vec.len() <= 1 {
+                                    return;
+                                }
+
+                                let idx = tabs_vec.iter().position(|t| t.id == *id);
+                                if let Some(idx) = idx {
+                                    tabs_vec.remove(idx);
+
+                                    if *active_id == *id {
+                                        let new_idx = idx.min(tabs_vec.len() - 1);
+                                        *active_id = tabs_vec[new_idx].id;
+                                        should_navigate = Some(tabs_vec[new_idx].url.clone());
+                                    } else {
+                                        should_navigate = None;
+                                    }
+                                } else {
+                                    should_navigate = None;
+                                }
+                            }
+
+                            if let Some(url) = should_navigate {
+                                let js = format!("window.location.href = '{}'", url.replace('\'', "\\'"));
+                                let _ = webview.evaluate_script(&js);
+                            } else {
+                                let (tabs_vec, active_id, _) = &*tabs.lock().unwrap();
+                                let current_url = tabs_vec.iter()
+                                    .find(|t| t.id == *active_id)
+                                    .map(|t| t.url.as_str())
+                                    .unwrap_or("about:blank");
+                                let tabs_data: Vec<_> = tabs_vec.iter()
+                                    .map(|t| (t.id, t.title.clone(), t.url.clone()))
+                                    .collect();
+                                let tabs_html = build_tabs_html(&tabs_data, *active_id);
+                                let script = inject_toolbar_script(&tabs_html, current_url);
+                                let _ = webview.evaluate_script(&script);
                             }
                         }
 
-                        let js = format!("window.location.href = '{}'", url.replace('\'', "\\'"));
-                        let _ = webview.evaluate_script(&js);
+                        UserEvent::SwitchTab(id) => {
+                            let url: String;
+                            {
+                                let (tabs_vec, active_id, _) = &mut *tabs.lock().unwrap();
+                                if let Some(tab) = tabs_vec.iter().find(|t| t.id == *id) {
+                                    *active_id = *id;
+                                    url = tab.url.clone();
+                                } else {
+                                    return;
+                                }
+                            }
+
+                            let js = format!("window.location.href = '{}'", url.replace('\'', "\\'"));
+                            let _ = webview.evaluate_script(&js);
+                        }
                     }
                 }
-            }
 
-            _ => {}
-        }
-    });
+                _ => {}
+            }
+        });
+    }
+}
+
+// ============== Main ==============
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
+    if args.headless {
+        // Run headless mode with tokio runtime
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(run_headless(args))
+    } else {
+        // Run GUI mode
+        gui::run_gui(args)
+    }
 }
