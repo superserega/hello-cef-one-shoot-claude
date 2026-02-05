@@ -26,11 +26,10 @@ enum UserEvent {
     CloseTab(usize),
     SwitchTab(usize),
     PageLoaded,
-    ScreenChanged,
 }
 
 type Tabs = Arc<Mutex<(Vec<Tab>, usize, usize)>>;
-type ScreenBuffer = Arc<Mutex<Option<Vec<u8>>>>; // Latest screenshot as JPEG bytes
+type ScreenBuffer = Arc<Mutex<Option<Vec<u8>>>>;
 type WindowRect = Arc<Mutex<(i32, i32, u32, u32)>>; // x, y, width, height
 
 const INIT_SCRIPT: &str = r#"
@@ -246,7 +245,7 @@ fn capture_window(window_rect: &WindowRect) -> Option<Vec<u8>> {
     let screens = Screen::all().ok()?;
     let screen = screens.first()?;
 
-    // Capture the specific area
+    // Capture the specific area (screenshots crate uses logical coordinates on macOS)
     let capture = screen.capture_area(x, y, width, height).ok()?;
 
     // Convert to JPEG
@@ -486,7 +485,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             Event::UserEvent(ref user_event) => {
                 match user_event {
-                    UserEvent::PageLoaded | UserEvent::ScreenChanged => {
+                    UserEvent::PageLoaded => {
                         let (tabs_vec, active_id, _) = &*tabs.lock().unwrap();
                         let current_url = tabs_vec.iter()
                             .find(|t| t.id == *active_id)
